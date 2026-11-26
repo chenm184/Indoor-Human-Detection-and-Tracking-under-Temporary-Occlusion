@@ -2,26 +2,18 @@ clear;
 clc;
 close all;
 
-%% 1. Define Variables
+%% Define Variables
 
 roomWidth  = 6;   % meters
 roomHeight = 6;   % meters
 
 % Fixed sensor position
-sensorPos = [0.5, 3.0];  
+sensorPos = [0.0 , 3.0];  
 % random obstacle
 obsWidth = 0.6;
-obsHeight = 1.5;
-%{
-xmin = 1 + rand()*(roomWidth-obsWidth-2);
-ymin = 1 + rand()*(roomHeight-obsHeight-2);
-
-obstacle = [xmin, xmin+obsWidth, ...
-            ymin, ymin+obsHeight];
-%}
-
+obsHeight = 1.2;
 dt = 0.1;              % sampling time
-T  = 12;               % total simulation time
+T  = 15;               % total simulation time
 t  = 0:dt:T;
 F = [1 0 dt 0;         %state model
      0 1 0 dt;
@@ -41,17 +33,17 @@ R = diag([0.04 0.04]);   %  sensor variance = 0.04 -> std = 0.2 m
 
 Z = nan(2,N);
 
-%% 3. Define Human Trajectory
+%% Define Human Trajectory
 
 % Start and end positions
 startPos = [1.0, 1.0];
-endPos   = [5.0, 5.0];
+%endPos   = [5.0, 5.0];
+humanRadius = 0.25;
 
 % Initialize State Space
 StateTrue = zeros(4,N);
 StateTrue(:,1) = [startPos(1),startPos(2),0.33,0.33];
 
-%% 4. Determine LOS / Occlusion
 
 for k = 1:N-1
     
@@ -60,9 +52,10 @@ for k = 1:N-1
 end
 %% Random Obstacle
 
+obstacleCreated = false;
 for k = 1:N
 
-    if t(k) >= 2
+    if t(k) == 5 && ~obstacleCreated
 
         targetPos = StateTrue(1:2,k)';
 
@@ -72,44 +65,71 @@ for k = 1:N
                     midPoint(2)-obsHeight/2, ...
                     midPoint(2)+obsHeight/2];
 
-    
+        obstacleCreated = true;
     end
 
 end
 
 
-%check whether the target is visible
+% check whether the target is visible
+A0 = 2; % attenuation factor
+occlusionRatio = zeros(N,1);
 isVisible = true(N,1);
+numRays = 20;
 for k = 1:N
+    targetCenter = StateTrue(1:2,k)';
+    blockedCount = 0;
+    angles = linspace(0,2*pi,numRays);
+    for j = 1:numRays
+        samplePoint = targetCenter + humanRadius*[cos(angles(j)), sin(angles(j))];
 
-    targetPos = StateTrue(1:2,k)';
+        if lineIntersectsRectangle(sensorPos, samplePoint, obstacle)
 
-    if lineIntersectsRectangle(sensorPos, targetPos, obstacle)
-
-        isVisible(k) = false;
-
-    else
-
-        isVisible(k) = true;
-
+            blockedCount = blockedCount + 1;
+        end
     end
-
+    occlusionRatio(k) = blockedCount / numRays;
 end
 
+%% Appling NP detector
+attenuation = 1 - occlusionRatio;
+Ak = A0 .* attenuation;
+[detected,Y] = np_detector(Ak,R(1));
+
+targetPresent = Ak > 0;
+trueDetection = detected & targetPresent;
+missedDetection = ~detected & targetPresent;
+falseAlarm = detected & ~targetPresent;
+correctRejection = ~detected & ~targetPresent;
+faIndex = find(falseAlarm);
+faTime = t(faIndex);
 
 for k = 1:N
-
-    if isVisible(k)
+    
+    if trueDetection(k)
 
         vk = chol(R,'lower') * randn(2,1);
-
         Z(:,k) = H*StateTrue(:,k) + vk;
-
+    elseif falseAlarm(k)
+        cx = roomWidth*rand();
+        cy = roomHeight*rand();
+        Z(:,k) = [cx;cy];
+       
     end
 
 end
 
-%% 5. Plot Static Environment
+
+%% Appling KF
+
+
+Q = sigma_a^2 * (G*G'); % covariance of dynamic model 4x4
+x0 = [startPos(1),startPos(2),0.0,0.0]';
+P0 = diag([0.05 0.05 0.5 0.5]);
+[Xhat, P_history] = kalman(Z, detected, F, H, Q, R, x0, P0);
+
+
+%% Plot Static Environment
 
 %Update xTrue, yTrue for plot
 xTrue = StateTrue(1,:);
@@ -210,23 +230,61 @@ for k = 1:N
 
 end
 
-%% 7. Plot Visibility Over Time
+
+
+
+%% Plotting the results
+% p1:2D trajectory comparison
+figure;
+hold on;
+grid on;
+axis equal;
+
+plot(StateTrue(1,:), StateTrue(2,:),'k--','LineWidth',1.5);
+
+scatter(Z(1,:), Z(2,:),'filled');
+
+plot(Xhat(1,:), Xhat(2,:),'LineWidth',1.5);
+
+xlabel('X Position [m]');
+ylabel('Y Position [m]');
+title('True Trajectory, Measurements, and Kalman Estimate');
+
+legend('True Trajectory', 'Sensor Measurements', 'Kalman Estimate');
+
+
+% p2: position error
+position_error = sqrt((Xhat(1,:) - StateTrue(1,:)).^2 + (Xhat(2,:) - StateTrue(2,:)).^2);
+figure;
+hold on;
+grid on;
+
+plot(t,position_error,'LineWidth',1.5);
+xlabel('Time [s]');
+ylabel('Position Error [m]');
+ylim([0,1.0]);
+
+title('Kalman Tracking Position Error');
+
+
+
+% p3: Kalman Position Uncertainty
 %{
+positionUncertainty = zeros(1,N);
+
+for k = 1:N
+    positionUncertainty(k) = ...
+        trace(P_history(1:2,1:2,k));
+end
+
 figure;
 
-stairs(t,isVisible,'LineWidth',1.5);
-
-ylim([-0.1 1.1]);
-
-yticks([0 1]);
-yticklabels({'Occluded','Visible'});
-
-xlabel('Time [s]');
-ylabel('Target Visibility');
-
-title('Target Visibility vs Time');
+plot(t, positionUncertainty, 'LineWidth', 1.5);
 
 grid on;
+xlabel('Time [s]');
+ylabel('tr(P_{position})');
+title('Kalman Position Uncertainty');
 %}
 %% -------------------------------------------------------
 % Local Function
